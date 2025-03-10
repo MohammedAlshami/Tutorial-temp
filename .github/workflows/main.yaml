@@ -1,0 +1,104 @@
+name: Build and Push Backend Docker Image to ECR
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'  # Only trigger when changes are made to backend directory
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-southeast-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure ECR Repository Exists
+        env:
+          ECR_REPOSITORY: pineapple-ripeness-backend  # More descriptive repository name
+        run: |
+          if ! aws ecr describe-repositories --repository-names $ECR_REPOSITORY > /dev/null 2>&1; then
+            echo "Repository $ECR_REPOSITORY does not exist. Creating it now."
+            aws ecr create-repository --repository-name $ECR_REPOSITORY
+          else
+            echo "Repository $ECR_REPOSITORY already exists."
+          fi
+
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: pineapple-ripeness-backend
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Change to backend directory for the docker build
+          cd backend
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Ensure Lambda Function Exists and Update
+        env:
+          FUNCTION_NAME: pineapple-ripeness-detector  # More descriptive function name
+          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/pineapple-ripeness-backend:${{ github.sha }}
+        run: |
+          # Check if the Lambda function exists
+          if ! aws lambda get-function --function-name $FUNCTION_NAME > /dev/null 2>&1; then
+            echo "Lambda function $FUNCTION_NAME does not exist. Creating it now."
+            aws lambda create-function \
+              --function-name $FUNCTION_NAME \
+              --package-type Image \
+              --code ImageUri=$IMAGE_URI \
+              --role arn:aws:iam::294980836836:role/lambda-execution-role \
+              --timeout 30 \
+              --memory-size 2048
+          else
+            echo "Lambda function $FUNCTION_NAME exists. Updating it now."
+            aws lambda update-function-code \
+              --function-name $FUNCTION_NAME \
+              --image-uri $IMAGE_URI
+          fi
+
+      - name: Enable Lambda Function URL
+        env:
+          FUNCTION_NAME: pineapple-ripeness-detector
+        run: |
+          # Check if function URL exists
+          if ! aws lambda get-function-url-config --function-name $FUNCTION_NAME > /dev/null 2>&1; then
+            echo "Creating function URL..."
+            FUNCTION_URL=$(aws lambda create-function-url-config --function-name $FUNCTION_NAME --auth-type NONE --query 'FunctionUrl' --output text)
+          else
+            echo "Updating function URL to ensure auth-type is NONE..."
+            aws lambda update-function-url-config --function-name $FUNCTION_NAME --auth-type NONE
+            FUNCTION_URL=$(aws lambda get-function-url-config --function-name $FUNCTION_NAME --query 'FunctionUrl' --output text)
+          fi
+          echo "Function URL is: $FUNCTION_URL"
+          echo "Function URL: $FUNCTION_URL" >> $GITHUB_STEP_SUMMARY
+
+      - name: Add Public Access Permission to Lambda Function
+        env:
+          FUNCTION_NAME: pineapple-ripeness-detector
+        run: |
+          # Check if the permission exists
+          if ! aws lambda get-policy --function-name $FUNCTION_NAME --query 'Policy' --output text 2>/dev/null | grep -q 'FunctionURLAllowPublicAccess'; then
+            echo "Adding public access permission..."
+            aws lambda add-permission \
+              --function-name $FUNCTION_NAME \
+              --action lambda:InvokeFunctionUrl \
+              --principal '*' \
+              --statement-id FunctionURLAllowPublicAccess \
+              --function-url-auth-type NONE
+          else
+            echo "Permission already exists."
+          fi
